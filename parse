@@ -1,0 +1,43 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use FindBin;
+use Cwd;
+
+my $path = '.';
+$path = $FindBin::Bin unless $FindBin::Bin eq getcwd;
+
+while (<>) {
+    chomp;
+    my @data = split /\t/;
+    shift @data if $data[0] =~ /^\d{4}$/;
+    my ($type, $quarter, $year, $surn, $given, 
+        $xtra, $dist, $vol, $page) = @data;
+    $xtra = uc $xtra;
+    $type = lc $type;  
+    $surn = uc $surn;
+
+    $given =~ s/\b([A-Z])([A-Z]+)/$1.lc $2/eg;
+    $dist  =~ s/\b([A-Z])([A-Z]+)/$1.lc $2/eg;
+
+    print "$surn, $given\n";
+    print "$type reg $quarter $year, $dist";
+    print "; to $xtra" if ( $type eq 'm' and length $xtra );
+    if ( $type eq 'd' and length $xtra ) {
+        if ( $xtra =~ /^(\d{2})([A-Z]{2})(\d{4})$/ ) {
+            my %mon = ( JE => 'Jun', JY => 'Jul', OC => 'Oct', NO => 'Nov' );
+            print "; b $1 $mon{$2} $3";
+        } else {
+            print "; a $xtra [".($year-$xtra)."]";
+        }
+    }
+    print " [$vol $page]\n";
+    if ($type eq 'm') {
+        print "$path/freebmd -M -$quarter -y$year -P$vol/$page";
+        print " -s $xtra" if length $xtra;
+        print "\n";
+    }
+    print "\n";
+}
