@@ -1,0 +1,367 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+no warnings 'experimental::smartmatch';
+use feature qw/switch say/;
+
+use Perl6::Junction qw/any none/;
+use Text::Trim;
+use FindBin;
+use WWW::Mechanize;
+
+my $FREEBMDHOST = $ENV{FREEBMDHOST} // "www.freebmd.org.uk";
+#my $USER_AGENT = $ENV{USER_AGENT} // 'GenMine (FreeBMD plugin)'; 
+my $USER_AGENT = $ENV{USER_AGENT} 
+  // 'Mozilla/5.0 (X11; Linux x86_64; rv:45.0) Gecko/20100101 Firefox/45.0';
+
+sub usage() {
+    print <<EOF;
+freebmd [OPTIONS]
+
+  -B, -M or -D	Restrict search to births, marriages or deaths
+  -s NAME	Look for surname
+  -d or -c NAME	Look in given county or district
+  -g NAME	Look for given name(s)
+  -y RANGE	Look for records in the range of years given
+  -x		Soundex match on surnames
+  -Q QUARTER	Look in given quarter of year
+  -P VOL/PAGE	Look in given volume and page number
+  -A RANGE	Look for (deaths of) people born in given years
+  -C		Look for candidate spouses on the same page
+  -S NAME	Look for spouse's surname or mother's maiden name
+
+EOF
+    exit 0;
+}
+
+sub error(@) {
+    say STDERR @_;
+    exit 1;
+}
+
+sub push_once(\$$$) {
+    my ($ref, $opt, $val) = @_;
+    $$ref = [] unless $$ref;
+    error "Repeated $opt value" if $val eq any @$$ref;
+    push @$$ref, $val;
+}
+
+sub set_once(\$$$) {
+    my ($ref, $opt, $val) = @_;
+    error "Cannot supply multiple $opt options" if defined $$ref;
+    $$ref = $val;
+}
+
+sub set_multi(\$$$) {
+    my ($ref, $opt, $val) = @_;
+    if (defined $$ref) {
+      if (ref $$ref eq 'ARRAY') { push @{$$ref->[0]}, $val; }
+      else { $$ref = [ $$ref, $val ]; }
+    }
+    else { $$ref = $val; }
+}
+
+my %districts; # Name => number
+my %counties;  # Name => comma-separated number list string
+
+sub load_districts() {
+    return if keys(%districts) > 0;
+
+    open my $data, '<', "$FindBin::Bin/districts" 
+        or die "Cannot read district data";
+    while (<$data>) {
+        chomp;
+        my ($num, $name) = split /\t/ or next;
+        $districts{$name} = $num;
+    }
+    close $data;
+}
+
+sub load_counties() {
+    return if keys(%counties) > 0;
+
+    open my $data, '<', "$FindBin::Bin/counties" 
+        or die "Cannot read county data";
+    while (<$data>) {
+        chomp;
+        my ($num, $name) = split /\t/ or next;
+        $counties{$name} = $num;
+    }
+    close $data;
+}
+
+sub find_district($) {
+    my ($arg) = @_;
+    load_districts();
+    my (@matches, @exact);
+    foreach my $name (keys %districts) {
+        if ((lc $name) eq (lc $arg)) { push @exact, $name; }
+        if ($name =~ /\Q$arg\E/i) { push @matches, $name; }
+    }
+    if (@exact) { @matches = @exact }
+    if (@matches > 1) {
+        print STDERR "Multiple districts match:\n";
+        print STDERR "  $_\n" foreach @matches;
+        exit 1;
+    }
+    elsif (@matches == 0) {
+        error "No districts match";
+    }
+    return $districts{$matches[0]};
+}
+
+sub find_county($) {
+    my ($arg) = @_;
+    load_counties();
+    if ($arg =~ /^[A-Z]{3}$/) {
+        foreach my $desc (values %counties) {
+            return $desc if $desc =~ /^$arg,/;
+        }
+        error "Short county code '$arg' is unrecognised";
+    }
+    my @matches;
+    foreach my $name (keys %counties) {
+        if ($name =~ /\Q$arg\E/i) { push @matches, $name; }
+    }
+    if (@matches > 1) {
+        print STDERR "Multiple counties match:\n";
+        print STDERR "  $_\n" foreach @matches;
+        exit 1;
+    }
+    elsif (@matches == 0) {
+        print STDERR "No counties match\n";
+        exit 1;
+    }
+    return $counties{$matches[0]};
+}
+
+sub parse_options(@) {
+    my %fields = ( type => [] );
+    
+    usage() if grep { /-h/ || /--help/ } @_;
+    
+    while (@_) { given (shift @_) {
+        when (/^-B$/) { push @{$fields{type}}, 'Births' }
+        when (/^-M$/) { push @{$fields{type}}, 'Marriages' }
+        when (/^-D$/) { push @{$fields{type}}, 'Deaths' }
+        when (/^-s(.*)$/) { 
+            set_once( $fields{surname}, "-s", length $1 ? $1 : shift ) }
+        when (/^-S(.*)$/) { 
+            set_once( $fields{s_surname}, "-S", length $1 ? $1 : shift ) }
+        when (/^-g(.*)$/) { 
+            set_once( $fields{given}, "-g", length $1 ? $1 : shift ) }
+        when (/^-y(.*)$/) {
+            my $arg = length $1 ? $1 : shift;
+            if ($arg =~ /^(\d{4})?-(\d{4})?$/) {
+                set_once( $fields{start}, "-y", $1 ) if defined $1;
+                set_once( $fields{end}, "-y", $2 ) if defined $2;
+            } elsif ($arg =~ /^\d{4}$/) {
+                set_once( $fields{start}, "-y", $arg );
+                set_once( $fields{end}, "-y", $arg );
+            } else { error "Malformed -y option"; } }
+        when (/^-A(.*)$/) {
+            my $arg = length $1 ? $1 : shift;
+            if ($arg =~ /^(\d{4})?-(\d{4})?$/ or $arg =~ /^\d{4}$/) {
+                set_once( $fields{aad}, "-A", '@'.$arg )
+            } elsif ($arg =~ /^(\d{1,3})?-(\d{1,3})?$/ or $arg =~ /^\d{1,3}$/) {
+                set_once( $fields{aad}, "-A", $arg );
+            } else { error "Malformed -A option"; } }
+        when (/^-Q(.*)$/) {
+            my $arg = length $1 ? $1 : shift;
+            if ($arg =~ /^([1234])-([1234])$/) {
+                set_once( $fields{sq}, "-Q", $1 );
+                set_once( $fields{eq}, "-Q", $2 ); 
+            } elsif ($arg =~ /^([1234])$/) {
+                set_once( $fields{sq}, "-Q", $1 );
+                set_once( $fields{eq}, "-Q", $1 );
+            } else { error "Malformed -Q option"; } }
+        when (/^-d(.*)$/) {
+            my $arg = length $1 ? $1 : shift;
+            set_multi( $fields{districtid}, "-d", find_district($arg) ); }
+        when (/^-c(.*)$/) {
+            my $arg = length $1 ? $1 : shift;
+            foreach (split m![,;/]\s*!, $arg) {
+                set_multi( $fields{countyid}, "-c", find_county($_) ); }}
+        when (/^-x$/) {
+            set_once( $fields{sndx}, $_, "on" ); }
+        when (/^-P(.*)$/) {
+            my $arg = length $1 ? $1 : shift;
+            $arg =~ m!^(\S+)/(\S+)$! or error "Malformed page reference in -P";
+            set_once( $fields{vol}, "-P", $1 );
+            set_once( $fields{pgno}, "-P", $2 ); }
+        when (/^-C$/) {
+            set_once( $fields{candidate_spouses}, $_, 1 ); }
+        when (/^--count$/) {
+            set_once( $fields{count_records}, $_, 1 ); }
+        default { 
+            error "Unknown option: $_" }
+    }}
+
+    @{$fields{type}} = 'All Types' unless @{$fields{type}};
+    unless ($fields{surname} or $fields{given} or $fields{vol} 
+            or $fields{s_surname}) {
+        error "Must supply at least a surname, given name or page reference"
+    }
+    if ($fields{candidate_spouses} and
+        not grep { /Marriages/ || /All Types/ } @{$fields{type}}) {
+        error "The -C option is only applicable to marriages"
+    }
+
+    return \%fields;
+}
+
+sub remote_fields($) {
+    my ($fields) = @_;
+    my $remote = {};
+    foreach (keys %$fields) {
+        unless ($_ eq 'candidate_spouses' or $_ eq 'count_records') {
+            $remote->{$_} = $fields->{$_};
+        }
+    }
+    return $remote;
+}
+
+sub trim_field(\$) {
+    my ($val) = @_;
+    $$val =~ s{^<A [^>]+>(.*)</A>}{$1}i;
+    $$val =~ s{^<B>(.*)</B>}{$1}i;
+    $$val =~ s{^<I>(.*)</I>}{$1\*}i;
+    $$val =~ s{&nbsp;}{ }g;
+    trim $$val;
+}
+
+sub execute_query(@);
+
+sub candidate_spouses(@) {
+    my ($type, $quarter, $year, $surn, $given, $xtra, $dist, $vol, $page) = @_;
+
+    die unless $type eq 'M';
+    my $res = execute_query "-M", "-$quarter", "-y$year", "-P$vol/$page";
+
+    my @candidates;
+
+    if ($xtra) { foreach (@$res) {
+        push @candidates, $_->[4].' '.uc($_->[3]) if uc($_->[3]) eq uc($xtra);
+    }}
+    if (!@candidates) { foreach (@$res) {
+        push @candidates, $_->[4].' '.uc($_->[3]);
+    }}
+    return '['. join(', ', @candidates). ']';
+}
+
+my $_checked_districts = {};
+
+sub lookup_district($$) {
+    my ($mech, $dist) = @_;
+    my ($url) = $dist =~ /<A HREF="(districts\.pl\?[^"]+)"/;
+    trim_field $dist;
+    return $dist unless $url;
+
+    if (not exists $_checked_districts->{uc $dist}) {
+        my $resp = $mech->get("http://$FREEBMDHOST/cgi/$url")->content();
+    
+        my $d = {};
+        if ($resp =~ m!is an alternative name for <b>([^</>]+)</b>!) {
+            $d->{name} = $1;
+        }
+        elsif ($resp =~ m!The district <b>([^</>]+)</b>!) {
+            $d->{name} = $1;
+        }
+    
+        if ($resp =~ m!is in the county of <b>([^</>]+)</b>!i) {
+            $d->{county} = $1;
+            $d->{counties} = [ $1 ];
+        }
+        elsif ($resp =~ m!spans the boundaries of the counties of ([^;]+);!i) {
+            my $span = $1;
+            $d->{counties} = [];
+            while ($span =~ m!<b>([^</>]+)</b>!ig) {
+                $d->{county} = $1 unless exists $d->{county};
+                push @{$d->{counties}}, $1;
+            }
+        }
+    
+        $_checked_districts->{uc $dist} = $d;
+    }
+
+    return $_checked_districts->{uc $dist}->{name};
+}
+
+sub execute_query(@) {
+    my $fields = parse_options @_;
+   
+    my $mech = new WWW::Mechanize( agent => $USER_AGENT );
+    my $form = $mech->get( "http://$FREEBMDHOST/cgi/search.pl" );
+    
+    {
+        $mech->form_number(1);
+        my $rf = remote_fields $fields;
+        #$mech->set_fields(%$rf);
+        foreach my $k ( keys %$rf ) {
+            if ( ref $rf->{$k} eq 'ARRAY' ) {
+                $mech->select( $k => $rf->{$k} );
+            } else {
+                $mech->field( $k => $rf->{$k} );
+            }
+        }
+    }
+     
+    my $resp;
+    if ($fields->{count_records}) {
+        $resp = $mech->click_button( value => 'Count' );
+    } else {
+        $resp = $mech->click_button( value => 'Find' );
+    }
+
+    unless ($resp->is_success()) {
+        error "Error from webserver: ".$resp->status_line();
+    }
+    
+    if ( $resp->content() =~ m/Sorry,\ that\ search\ found\ (\d+)\ matches\ and
+            \ the\ maximum\ number\ that\ can\ be\ displayed\ is\ (\d+)/x ) {
+        error $&;
+    } 
+
+    if ( $fields->{count_records} 
+         and $resp->content() =~ /(\d+) records match your query/ ) {
+        print "$&\n";
+        exit 0;
+    }
+
+    my $results = [];   
+ 
+    my ($type, $quarter, $year);
+    for (split /\n/, $resp->content()) {
+        if ( m{<TR><TH\ COLSPAN=6><HR><FONT\ SIZE="\+1"> \s*
+               (Births|Marriages|Deaths) \s+
+               (Mar|Jun|Sep|Dec) \s*
+               ([0-9]{4}) \s*
+               </FONT><HR></TR>}ix ) {
+            ($type, $quarter, $year) = ($1, $2, $3);
+            my %quarters = ( Mar => 1, Jun => 2, Sep => 3, Dec => 4 );
+            $quarter = 'Q'.$quarters{$quarter};
+            my %types = ( Births => 'B', Marriages => 'M', Deaths => 'D' );
+            $type = $types{$type};
+        }
+        next unless $type;
+    
+        if ( m!<TR><TD BGCOLOR="#[c9f]{6}">(.*)$! ) {
+            my @fields = split '<TD>', $1;
+            # $surn, $given, $xtra, $dist, $vol, $page
+            $fields[3] = lookup_district($mech, $fields[3]);
+            trim_field $fields[$_] foreach (0..$#fields);
+            my $this_res = [ $type, $quarter, $year, @fields[0 .. 5] ];
+            if ($fields->{candidate_spouses} and $type eq 'M') { 
+                push @$this_res, candidate_spouses @$this_res; }
+            push @$results, $this_res;
+        }
+    }
+
+    return $results;
+}
+
+foreach (@{ execute_query @ARGV }) {
+    print join( "\t", @$_ ), "\n";
+}
